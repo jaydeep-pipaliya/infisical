@@ -20,6 +20,7 @@ import { EXTERNAL_KMS_REGISTER_ROUTER_MAP } from "./external-kms-routers";
 import { registerGatewayRouter } from "./gateway-router";
 import { registerGithubOrgSyncRouter } from "./github-org-sync-router";
 import { registerGroupRouter } from "./group-router";
+import { registerHoneyTokenRouter } from "./honey-token-router";
 import { registerIdentityProjectAdditionalPrivilegeRouter } from "./identity-project-additional-privilege-router";
 import { registerIdentityTemplateRouter } from "./identity-template-router";
 import { registerInsightsRouter } from "./insights-router";
@@ -117,6 +118,7 @@ export const registerV1EERoutes = async (server: FastifyZodProvider) => {
   await server.register(registerGatewayRouter, { prefix: "/gateways" });
   await server.register(registerRelayRouter, { prefix: "/relays" });
   await server.register(registerGithubOrgSyncRouter, { prefix: "/github-org-sync-config" });
+  await server.register(registerHoneyTokenRouter, { prefix: "/honey-tokens" });
 
   await server.register(registerInsightsRouter, { prefix: "/insights" });
 
