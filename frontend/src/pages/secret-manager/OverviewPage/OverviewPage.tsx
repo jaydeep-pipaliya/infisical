@@ -29,7 +29,11 @@ import { UpgradePlanModal } from "@app/components/license/UpgradePlanModal";
 import { createNotification } from "@app/components/notifications";
 import { ProjectPermissionCan } from "@app/components/permissions";
 import { CreateSecretRotationV2Modal } from "@app/components/secret-rotations-v2";
-import { DeleteHoneyTokenModal, EditHoneyTokenModal } from "@app/components/honey-tokens";
+import {
+  DeleteHoneyTokenModal,
+  EditHoneyTokenModal,
+  ViewHoneyTokenCredentialsModal
+} from "@app/components/honey-tokens";
 import { DeleteSecretRotationV2Modal } from "@app/components/secret-rotations-v2/DeleteSecretRotationV2Modal";
 import { EditSecretRotationV2Modal } from "@app/components/secret-rotations-v2/EditSecretRotationV2Modal";
 import { ReconcileLocalAccountRotationModal } from "@app/components/secret-rotations-v2/ReconcileLocalAccountRotationModal";
@@ -775,7 +779,8 @@ const OverviewPageContent = () => {
     "importFromDoppler",
     "confirmDisableBatchMode",
     "editHoneyToken",
-    "deleteHoneyToken"
+    "deleteHoneyToken",
+    "viewHoneyTokenCredentials"
   ] as const);
 
   // Auto-open dynamic secret leases modal when linked via notification/email
@@ -3052,6 +3057,9 @@ const OverviewPageContent = () => {
                               onDelete={(honeyToken) =>
                                 handlePopUpOpen("deleteHoneyToken", honeyToken)
                               }
+                              onViewCredentials={(honeyToken) =>
+                                handlePopUpOpen("viewHoneyTokenCredentials", honeyToken)
+                              }
                             />
                           ))}
                           {mergedSecKeys.map((key, index) => (
@@ -3400,6 +3408,12 @@ const OverviewPageContent = () => {
         isOpen={popUp.deleteHoneyToken.isOpen}
         honeyToken={popUp.deleteHoneyToken.data as TDashboardHoneyToken}
         onOpenChange={(isOpen) => handlePopUpToggle("deleteHoneyToken", isOpen)}
+      />
+      <ViewHoneyTokenCredentialsModal
+        isOpen={popUp.viewHoneyTokenCredentials.isOpen}
+        honeyToken={popUp.viewHoneyTokenCredentials.data as TDashboardHoneyToken}
+        projectId={projectId}
+        onOpenChange={(isOpen) => handlePopUpToggle("viewHoneyTokenCredentials", isOpen)}
       />
       <ImportSecretsModal
         isOpen={popUp.importSecrets.isOpen}
