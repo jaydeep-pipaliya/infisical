@@ -4,7 +4,7 @@
  * Prerequisites (handled by vitest-environment-knex.ts):
  *   - testServer: running Fastify instance
  *   - jwtAuthToken: pre-authenticated admin JWT (user session)
- *   - testDb: knex instance (not used directly here)
+ *   - testDb: knex instance
  *
  * These tests create and tear down temporary identities so they do not
  * depend on or mutate the seeded machine identity.
@@ -12,7 +12,7 @@
 
 import jwt from "jsonwebtoken";
 
-import { OrgMembershipRole } from "@app/db/schemas";
+import { OrgMembershipRole, TableName } from "@app/db/schemas";
 import { seedData1 } from "@app/db/seed-data";
 import { getConfig } from "@app/lib/config/env";
 import { AuthTokenType } from "@app/services/auth/auth-type";
@@ -28,6 +28,7 @@ const createUaIdentity = async (
     accessTokenTTL?: number;
     accessTokenMaxTTL?: number;
     accessTokenNumUsesLimit?: number;
+    accessTokenTrustedIps?: Array<{ ipAddress: string }>;
   } = {}
 ) => {
   // 1. Create bare identity
@@ -55,7 +56,8 @@ const createUaIdentity = async (
     body: {
       accessTokenTTL: ttl,
       accessTokenMaxTTL: maxTtl,
-      accessTokenNumUsesLimit: uaConfig.accessTokenNumUsesLimit ?? 0
+      accessTokenNumUsesLimit: uaConfig.accessTokenNumUsesLimit ?? 0,
+      accessTokenTrustedIps: uaConfig.accessTokenTrustedIps
     }
   });
   expect(attachRes.statusCode).toBe(200);
@@ -68,7 +70,7 @@ const createUaIdentity = async (
     body: {}
   });
   expect(csRes.statusCode).toBe(200);
-  const { clientSecret } = csRes.json() as { clientSecret: string };
+  const { clientSecret } = csRes.json();
   const clientId = attachRes.json().identityUniversalAuth.clientId as string;
 
   return { identityId: identity.id, clientId, clientSecret };
@@ -94,16 +96,63 @@ const deleteIdentity = async (identityId: string) => {
   });
 };
 
+const cleanupIdentityDirect = async (identityId: string) => {
+  await testDb(TableName.Identity).where({ id: identityId }).delete();
+};
+
+const updateUaAccessTokenTrustedIps = async (identityId: string, ips: Array<{ ipAddress: string }>) => {
+  const res = await testServer.inject({
+    method: "PATCH",
+    url: `/api/v1/auth/universal-auth/identities/${identityId}`,
+    headers: { authorization: `Bearer ${jwtAuthToken}` },
+    body: {
+      accessTokenTrustedIps: ips
+    }
+  });
+  expect(res.statusCode).toBe(200);
+};
+
+const deleteOrgIdentityMembership = async (identityId: string) => {
+  const res = await testServer.inject({
+    method: "DELETE",
+    url: `/api/v1/organization/identity-memberships/${identityId}`,
+    headers: { authorization: `Bearer ${jwtAuthToken}` }
+  });
+  expect(res.statusCode).toBe(200);
+};
+
+const waitForRevocationRow = async (tokenId: string) => {
+  const deadline = Date.now() + 10_000;
+
+  while (Date.now() < deadline) {
+    // eslint-disable-next-line no-await-in-loop
+    const row = await testDb(TableName.IdentityAccessTokenRevocation)
+      .where({ id: tokenId })
+      .first<{ id: string; identityId: string; expiresAt: Date }>();
+
+    if (row) {
+      return row;
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+  }
+
+  throw new Error(`Timed out waiting for identity access token revocation row ${tokenId}`);
+};
+
 /**
  * Hit a lightweight authenticated endpoint that accepts IDENTITY_ACCESS_TOKEN.
  * GET /api/v1/identities/details only accepts identity tokens — ideal for
  * validating whether a given token is currently authorised.
  */
-const callDetailsEndpoint = (accessToken: string) =>
+const callDetailsEndpoint = (accessToken: string, ip?: string) =>
   testServer.inject({
     method: "GET",
     url: "/api/v1/identities/details",
-    headers: { authorization: `Bearer ${accessToken}` }
+    headers: { authorization: `Bearer ${accessToken}`, ...(ip ? { "x-forwarded-for": ip } : {}) }
   });
 
 // ---------------------------------------------------------------------------
@@ -242,6 +291,83 @@ describe("Identity Access Token — redesigned JWT flow", () => {
       expect(res3.statusCode).toBe(401);
     } finally {
       await deleteIdentity(identityId);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. Trusted-IP config changes invalidate already issued tokens
+  // -------------------------------------------------------------------------
+  test("trusted IP changes invalidate old tokens from disallowed IPs", async () => {
+    const { identityId, clientId, clientSecret } = await createUaIdentity("test-stale-trusted-ip", {
+      accessTokenTrustedIps: [{ ipAddress: "0.0.0.0/0" }, { ipAddress: "::/0" }]
+    });
+
+    try {
+      const accessToken = await loginWithUa(clientId, clientSecret);
+
+      expect((await callDetailsEndpoint(accessToken)).statusCode).toBe(200);
+
+      await updateUaAccessTokenTrustedIps(identityId, [{ ipAddress: "10.0.0.0/24" }]);
+
+      expect((await callDetailsEndpoint(accessToken, "192.168.1.1")).statusCode).toBe(401);
+    } finally {
+      await deleteIdentity(identityId);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 7. Org membership changes invalidate already issued tokens
+  // -------------------------------------------------------------------------
+  test("org membership removal invalidates old tokens", async () => {
+    const { identityId, clientId, clientSecret } = await createUaIdentity("test-stale-org-membership");
+
+    try {
+      const accessToken = await loginWithUa(clientId, clientSecret);
+
+      expect((await callDetailsEndpoint(accessToken)).statusCode).toBe(200);
+
+      await deleteOrgIdentityMembership(identityId);
+
+      expect((await callDetailsEndpoint(accessToken)).statusCode).toBe(401);
+    } finally {
+      await cleanupIdentityDirect(identityId);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 8. Per-token revocation survives Redis loss through PG hydration
+  // -------------------------------------------------------------------------
+  test("zero-TTL revocation survives Redis loss through PG hydration", async () => {
+    const { identityId, clientId, clientSecret } = await createUaIdentity("test-revoke-hydrate", {
+      accessTokenTTL: 0,
+      accessTokenMaxTTL: 0
+    });
+
+    try {
+      const accessToken = await loginWithUa(clientId, clientSecret);
+      const decoded = jwt.decode(accessToken) as { exp: number; identityAccessTokenId: string } | null;
+      expect(decoded).not.toBeNull();
+      expect(typeof decoded!.exp).toBe("number");
+      expect(typeof decoded!.identityAccessTokenId).toBe("string");
+
+      const revokeRes = await testServer.inject({
+        method: "POST",
+        url: "/api/v1/auth/token/revoke",
+        body: { accessToken }
+      });
+      expect(revokeRes.statusCode).toBe(200);
+
+      const revocation = await waitForRevocationRow(decoded!.identityAccessTokenId);
+      const expectedExpiresAtMs = decoded!.exp * 1000;
+      expect(revocation.expiresAt.getTime()).toBeGreaterThan(Date.now());
+      expect(Math.abs(revocation.expiresAt.getTime() - expectedExpiresAtMs)).toBeLessThanOrEqual(2_000);
+
+      await testRedis.flushdb("SYNC");
+      await testServer.services.identityAccessToken.hydrateRedisFromPg();
+
+      expect((await callDetailsEndpoint(accessToken)).statusCode).toBe(401);
+    } finally {
+      await cleanupIdentityDirect(identityId);
     }
   });
 });
